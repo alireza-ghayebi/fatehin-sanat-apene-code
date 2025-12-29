@@ -4,9 +4,12 @@
    - Endpoints:
      GET  /              -> Web UI
      GET  /api/status    -> JSON status (requires Authorization header)
-     POST /api/cmd       -> command (Connect/Disconnect/RunRF/RunBB/Stop/Reboot/Record)
+     POST /api/cmd       -> command (Connect/Disconnect/RunRF/RunBB/Stop/Reboot/Record/StopRecord)
      GET  /api/settings  -> get current settings
      POST /api/settings  -> apply new settings
+     GET  /api/time      -> RTC time
+     POST /api/time      -> set RTC time
+     GET  /api/sd        -> SD status
 
    Radar:
    - UART to X4M03
@@ -23,6 +26,11 @@
 #include <WebServer.h>
 #include <Adafruit_NeoPixel.h>
 #include "esp_timer.h"
+#include <Wire.h>
+#include <RTClib.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
 
 struct RadarSettings;
 static bool apply_settings(const RadarSettings& s);
@@ -53,7 +61,19 @@ static bool isAuthorized() {
 #define LED_PIN 48
 #endif
 
+#ifndef I2C_SDA
+#define I2C_SDA 8
+#endif
+#ifndef I2C_SCL
+#define I2C_SCL 9
+#endif
+
+#ifndef SD_CS
+#define SD_CS 10
+#endif
+
 HardwareSerial RadarSerial(RADAR_UART_NUM);
+RTC_DS3231 rtc;
 
 /* ================= NeoPixel ================= */
 Adafruit_NeoPixel pixels(1, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -101,8 +121,7 @@ const uint32_t XTS_SPRS_READY = 0x00000011;
   0  Idle
   1  RunBB
   2  RunRF
-  10 RecordBB (later)
-  20 RecordRF (later)
+  Recording uses a separate flag (gRecording).
 */
 static volatile int RunStatus = 0;
 static volatile bool RadarConnected = false;
@@ -115,6 +134,27 @@ static volatile uint32_t LastBytesRem = 0;
 
 static uint32_t bootMs = 0;
 static volatile bool LastApplyOk = true;
+
+/* ================= RTC / SD / Recording ================= */
+static bool gRtcReady = false;
+static bool gSdReady = false;
+static char gRtcError[64] = "";
+static char gSdError[96] = "";
+
+static int64_t gRtcBaseUs = 0;
+static uint64_t gRtcBaseEpochMs = 0;
+static int64_t gRtcLastSyncUs = 0;
+
+static bool gRecording = false;
+static uint8_t gRecordMode = 0;
+static char gRecordPath[64] = "";
+static char gRecordError[96] = "";
+static char gRecordInfo[96] = "";
+static uint64_t gRecordLines = 0;
+static uint64_t gRecordBytes = 0;
+static int64_t gRecordLastFlushUs = 0;
+static File gRecordFile;
+static SemaphoreHandle_t gRecordMutex = nullptr;
 
 /* ================= RF Snapshot for UI ================= */
 static const uint16_t RF_UI_MAX = 256;
@@ -218,6 +258,342 @@ static bool jsonGetNumber(const String& body, const char* key, double& out) {
   if (e <= s) return false;
 
   out = body.substring(s, e).toDouble();
+  return true;
+}
+
+/* ================= RTC / SD / Record helpers ================= */
+static inline bool radarIsStreaming() {
+  return (RunStatus == 1 || RunStatus == 2);
+}
+
+static void setRtcError(const char* msg) {
+  snprintf(gRtcError, sizeof(gRtcError), "%s", (msg ? msg : ""));
+}
+
+static void setSdError(const char* msg) {
+  snprintf(gSdError, sizeof(gSdError), "%s", (msg ? msg : ""));
+}
+
+static void setRecordError(const char* msg) {
+  snprintf(gRecordError, sizeof(gRecordError), "%s", (msg ? msg : ""));
+}
+
+static void setRecordInfo(const char* msg) {
+  snprintf(gRecordInfo, sizeof(gRecordInfo), "%s", (msg ? msg : ""));
+}
+
+static bool rtcSyncQuick() {
+  if (!gRtcReady) return false;
+  DateTime now = rtc.now();
+  int64_t nowUs = esp_timer_get_time();
+  gRtcBaseEpochMs = (uint64_t)now.unixtime() * 1000ULL;
+  gRtcBaseUs = nowUs;
+  gRtcLastSyncUs = nowUs;
+  return true;
+}
+
+static bool rtcSyncAligned(uint32_t timeoutMs) {
+  if (!gRtcReady) return false;
+  DateTime prev = rtc.now();
+  int64_t startUs = esp_timer_get_time();
+  while ((uint32_t)((esp_timer_get_time() - startUs) / 1000) < timeoutMs) {
+    DateTime cur = rtc.now();
+    if (cur.second() != prev.second() || cur.unixtime() != prev.unixtime()) {
+      int64_t nowUs = esp_timer_get_time();
+      gRtcBaseEpochMs = (uint64_t)cur.unixtime() * 1000ULL;
+      gRtcBaseUs = nowUs;
+      gRtcLastSyncUs = nowUs;
+      return true;
+    }
+    prev = cur;
+    delay(2);
+  }
+  return rtcSyncQuick();
+}
+
+static uint64_t rtcEpochMs() {
+  if (!gRtcReady) return (uint64_t)millis();
+  int64_t nowUs = esp_timer_get_time();
+  if ((nowUs - gRtcLastSyncUs) > 5000000) rtcSyncQuick();
+  return gRtcBaseEpochMs + (uint64_t)((nowUs - gRtcBaseUs) / 1000);
+}
+
+static void formatIsoTimestamp(uint64_t epoch_ms, char* out, size_t out_len) {
+  uint32_t epoch_s = (uint32_t)(epoch_ms / 1000ULL);
+  uint16_t ms = (uint16_t)(epoch_ms % 1000ULL);
+  DateTime dt(epoch_s);
+  snprintf(out, out_len, "%04d-%02d-%02dT%02d:%02d:%02d.%03u",
+           dt.year(), dt.month(), dt.day(),
+           dt.hour(), dt.minute(), dt.second(), ms);
+}
+
+static bool initRtc() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!rtc.begin()) {
+    gRtcReady = false;
+    setRtcError("RTC not found");
+    return false;
+  }
+  gRtcReady = true;
+  setRtcError("");
+  rtcSyncAligned(1200);
+  return true;
+}
+
+static const char* sdCardTypeName(uint8_t type) {
+  switch (type) {
+    case CARD_MMC: return "MMC";
+    case CARD_SD: return "SD";
+    case CARD_SDHC: return "SDHC";
+    case CARD_NONE: return "NONE";
+    default: return "UNKNOWN";
+  }
+}
+
+static uint64_t sdUsedBytes(fs::FS& fs, const char* dir, uint8_t depth) {
+  if (depth > 6) return 0;
+  File root = fs.open(dir);
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return 0;
+  }
+  uint64_t total = 0;
+  File file = root.openNextFile();
+  while (file) {
+    if (file.isDirectory()) {
+      char path[96];
+      if (strcmp(dir, "/") == 0) snprintf(path, sizeof(path), "/%s", file.name());
+      else snprintf(path, sizeof(path), "%s/%s", dir, file.name());
+      total += sdUsedBytes(fs, path, depth + 1);
+    } else {
+      total += file.size();
+    }
+    file = root.openNextFile();
+  }
+  root.close();
+  return total;
+}
+
+static bool initSd() {
+  SPI.begin();
+  if (!SD.begin(SD_CS)) {
+    gSdReady = false;
+    setSdError("SD mount failed");
+    return false;
+  }
+  if (SD.cardType() == CARD_NONE) {
+    gSdReady = false;
+    setSdError("No SD card");
+    return false;
+  }
+  gSdReady = true;
+  setSdError("");
+  return true;
+}
+
+static inline bool recordLock(TickType_t to) {
+  return (gRecordMutex && (xSemaphoreTake(gRecordMutex, to) == pdTRUE));
+}
+
+static inline void recordUnlock() {
+  if (gRecordMutex) xSemaphoreGive(gRecordMutex);
+}
+
+static void recordStopLocked(bool isError, const char* msg) {
+  if (!gRecording) return;
+  if (isError) {
+    if (msg && *msg) setRecordError(msg);
+    setRecordInfo("");
+  } else {
+    setRecordError("");
+    if (msg && *msg) setRecordInfo(msg);
+  }
+  if (gRecordFile) {
+    gRecordFile.flush();
+    gRecordFile.close();
+  }
+  gRecording = false;
+  gRecordMode = 0;
+}
+
+static void recordStop(bool isError, const char* msg) {
+  if (!recordLock(portMAX_DELAY)) return;
+  recordStopLocked(isError, msg);
+  recordUnlock();
+}
+
+static bool ensureRecordDir() {
+  const char* dir = "/records";
+  if (SD.exists(dir)) return true;
+  return SD.mkdir(dir);
+}
+
+static bool buildRecordPath(char* out, size_t out_len, uint8_t mode) {
+  uint64_t epoch_ms = rtcEpochMs();
+  DateTime dt((uint32_t)(epoch_ms / 1000ULL));
+  uint16_t ms = (uint16_t)(epoch_ms % 1000ULL);
+  const char* tag = (mode == 1) ? "BB" : "RF";
+  for (uint16_t seq = 0; seq < 1000; seq++) {
+    if (seq == 0) {
+      snprintf(out, out_len, "/records/%04d%02d%02d_%02d%02d%02d_%03u_%s.csv",
+               dt.year(), dt.month(), dt.day(),
+               dt.hour(), dt.minute(), dt.second(), ms, tag);
+    } else {
+      snprintf(out, out_len, "/records/%04d%02d%02d_%02d%02d%02d_%03u_%s_%u.csv",
+               dt.year(), dt.month(), dt.day(),
+               dt.hour(), dt.minute(), dt.second(), ms, tag, seq);
+    }
+    if (!SD.exists(out)) return true;
+  }
+  return false;
+}
+
+static bool recordStart() {
+  if (!recordLock(portMAX_DELAY)) return false;
+  if (gRecording) {
+    recordUnlock();
+    return true;
+  }
+
+  setRecordError("");
+  setRecordInfo("");
+
+  if (!gSdReady) initSd();
+  if (!gSdReady) {
+    setRecordError("SD not mounted");
+    recordUnlock();
+    return false;
+  }
+  if (!gRtcReady) initRtc();
+  if (!gRtcReady) {
+    setRecordError("RTC not ready");
+    recordUnlock();
+    return false;
+  }
+  if (!radarIsStreaming()) {
+    setRecordError("Radar not in RF/BB");
+    recordUnlock();
+    return false;
+  }
+
+  rtcSyncAligned(1200);
+
+  if (!ensureRecordDir()) {
+    setRecordError("SD mkdir failed");
+    recordUnlock();
+    return false;
+  }
+
+  if (!buildRecordPath(gRecordPath, sizeof(gRecordPath), (uint8_t)RunStatus)) {
+    setRecordError("File name error");
+    recordUnlock();
+    return false;
+  }
+
+  gRecordFile = SD.open(gRecordPath, FILE_WRITE);
+  if (!gRecordFile) {
+    setRecordError("File open failed");
+    recordUnlock();
+    return false;
+  }
+
+  gRecordMode = (uint8_t)RunStatus;
+  gRecordLines = 0;
+  gRecordBytes = 0;
+  gRecordLastFlushUs = esp_timer_get_time();
+  gRecording = true;
+  setRecordInfo("Recording");
+  gRecordFile.println("timestamp_iso,epoch_ms,mode,payload_len,payload_hex");
+
+  recordUnlock();
+  return true;
+}
+
+static bool recordWritePacket(const uint8_t* payload, uint32_t len, uint8_t mode) {
+  if (!gRecording) return true;
+  if (!recordLock(portMAX_DELAY)) return false;
+  if (!gRecording) {
+    recordUnlock();
+    return true;
+  }
+
+  if (!gRecordFile) {
+    recordStopLocked(true, "Record file closed");
+    recordUnlock();
+    return false;
+  }
+  if (!gSdReady || SD.cardType() == CARD_NONE) {
+    gSdReady = false;
+    setSdError("No SD card");
+    recordStopLocked(true, "SD not mounted");
+    recordUnlock();
+    return false;
+  }
+  if (mode != 1 && mode != 2) {
+    recordStopLocked(false, "Radar idle");
+    recordUnlock();
+    return false;
+  }
+
+  uint64_t epoch_ms = rtcEpochMs();
+  char ts[32];
+  formatIsoTimestamp(epoch_ms, ts, sizeof(ts));
+
+  const char* modeStr = (mode == 1) ? "BB" : "RF";
+  char prefix[128];
+  int n = snprintf(prefix, sizeof(prefix), "%s,%llu,%s,%u,", ts,
+                   (unsigned long long)epoch_ms, modeStr, (unsigned int)len);
+  if (n <= 0 || n >= (int)sizeof(prefix)) {
+    recordStopLocked(true, "CSV format error");
+    recordUnlock();
+    return false;
+  }
+  if (gRecordFile.write((const uint8_t*)prefix, (size_t)n) != (size_t)n) {
+    recordStopLocked(true, "SD write failed");
+    recordUnlock();
+    return false;
+  }
+
+  static const char hex[] = "0123456789ABCDEF";
+  char hexBuf[64];
+  size_t hexCount = 0;
+  for (uint32_t i = 0; i < len; i++) {
+    uint8_t b = payload[i];
+    hexBuf[hexCount++] = hex[b >> 4];
+    hexBuf[hexCount++] = hex[b & 0x0F];
+    if (hexCount == sizeof(hexBuf)) {
+      if (gRecordFile.write((const uint8_t*)hexBuf, hexCount) != hexCount) {
+        recordStopLocked(true, "SD write failed");
+        recordUnlock();
+        return false;
+      }
+      hexCount = 0;
+    }
+  }
+  if (hexCount > 0) {
+    if (gRecordFile.write((const uint8_t*)hexBuf, hexCount) != hexCount) {
+      recordStopLocked(true, "SD write failed");
+      recordUnlock();
+      return false;
+    }
+  }
+
+  if (gRecordFile.write((uint8_t)'\n') != 1) {
+    recordStopLocked(true, "SD write failed");
+    recordUnlock();
+    return false;
+  }
+
+  gRecordLines++;
+  gRecordBytes += len;
+
+  int64_t nowUs = esp_timer_get_time();
+  if ((nowUs - gRecordLastFlushUs) > 1500000) {
+    gRecordFile.flush();
+    gRecordLastFlushUs = nowUs;
+  }
+
+  recordUnlock();
   return true;
 }
 
@@ -328,6 +704,10 @@ static bool apply_settings(const RadarSettings& s) {
   if (!RadarConnected) {
     LastApplyOk = false;
     return false;
+  }
+
+  if (gRecording && (s.downconv != gSet.downconv)) {
+    recordStop(false, "Mode changed");
   }
 
   bool ok = true;
@@ -450,6 +830,7 @@ static void radarConnect() {
 
 static void radarDisconnect() {
   if (!RadarConnected) return;
+  if (gRecording) recordStop(false, "Radar disconnected");
   sendSetMode(XTS_SM_STOP);
   expectAck();
   RadarSerial.end();
@@ -459,6 +840,7 @@ static void radarDisconnect() {
 
 static void radarRunRF() {
   if (!RadarConnected) radarConnect();
+  if (gRecording) recordStop(false, "Mode changed");
   FramesStored = 0;
   FrameCounter = 0;
   clearRfSnapshot();
@@ -471,6 +853,7 @@ static void radarRunRF() {
 
 static void radarRunBB() {
   if (!RadarConnected) radarConnect();
+  if (gRecording) recordStop(false, "Mode changed");
   FramesStored = 0;
   FrameCounter = 0;
   clearRfSnapshot();
@@ -486,6 +869,7 @@ static void radarStop() {
     RunStatus = 0;
     return;
   }
+  if (gRecording) recordStop(false, "Radar stopped");
   sendSetMode(XTS_SM_STOP);
   expectAck();
   RunStatus = 0;
@@ -521,6 +905,14 @@ void radarTask(void*) {
       bool ok = readNoEscapePacket(payload, sizeof(payload), pkt_len);
 
       if (ok && pkt_len > 0) {
+        if (gRecording) {
+          if (!radarIsStreaming()) {
+            recordStop(false, "Radar idle");
+          } else {
+            recordWritePacket(payload, pkt_len, (uint8_t)RunStatus);
+          }
+        }
+
         packetCount++;
         packetsInMinute++;
         totalBytes += pkt_len;
@@ -661,6 +1053,7 @@ void radarTask(void*) {
 
       vTaskDelay(1);
     } else {
+      if (gRecording) recordStop(false, "Radar idle");
       led_set(5, 5);
       lastFrame = 0xFFFFFFFF;
       vTaskDelay(20 / portTICK_PERIOD_MS);
@@ -711,6 +1104,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       box-shadow:var(--shadow);
     }
     .grid{display:grid; grid-template-columns: 380px 1fr; gap:16px; margin-top:16px;}
+    .stack{display:flex; flex-direction:column; gap:16px;}
     @media (max-width:900px){ .grid{grid-template-columns:1fr;} .wrap{padding:16px;} }
     button{
       border:1px solid rgba(148,163,184,0.2);
@@ -722,6 +1116,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       background:rgba(31,42,58,0.9);
       transition:transform .15s ease, box-shadow .15s ease, filter .15s ease;
     }
+    button:disabled{opacity:.55; cursor:not-allowed; filter:grayscale(0.2);}
     button:active{transform:translateY(1px) scale(0.99);}
     button:focus-visible{outline:2px solid rgba(56,189,248,0.6); outline-offset:2px;}
     .btn{
@@ -760,6 +1155,18 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       border-color:rgba(56,189,248,0.6);
     }
     .note{opacity:.75; font-size:13px; margin-top:10px; line-height:1.7; color:var(--muted);}
+    .status-pill{
+      padding:6px 10px;
+      border-radius:999px;
+      font-weight:800;
+      font-size:12px;
+      border:1px solid rgba(56,189,248,0.5);
+      background:rgba(56,189,248,0.15);
+    }
+    .status-pill.recording{
+      border-color:rgba(239,68,68,0.7);
+      background:rgba(239,68,68,0.18);
+    }
     .big{
       min-height:340px;
       display:flex;
@@ -819,7 +1226,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   </div>
 
   <div class="grid">
-    <div class="card">
+    <div class="stack">
+      <div class="card">
       <div style="font-weight:800;margin-bottom:10px">کنترل</div>
       <div class="row">
         <button class="btn good" onclick="cmd('Connect')">Connect</button>
@@ -890,6 +1298,58 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       </div>
     </div>
 
+    <div class="card" id="recordSection">
+      <div style="font-weight:800;margin-bottom:10px">Recording</div>
+      <div class="row" style="align-items:center">
+        <span class="status-pill" id="recordState">Idle</span>
+        <button class="btn good" id="recordBtn" onclick="startRecord()">Record</button>
+        <button class="btn danger" id="stopRecordBtn" onclick="stopRecord()">Stop</button>
+      </div>
+      <div class="kv">
+        <div class="k">File</div><div class="v" id="recordFile">-</div>
+        <div class="k">Lines</div><div class="v" id="recordLines">-</div>
+        <div class="k">Bytes</div><div class="v" id="recordBytes">-</div>
+      </div>
+      <div class="note" id="recordNote">-</div>
+    </div>
+
+    <div class="card" id="rtcSection">
+      <div style="font-weight:800;margin-bottom:10px">RTC Time</div>
+      <div class="row" style="align-items:center">
+        <span class="k">Current</span>
+        <div class="v" id="rtcNow">-</div>
+      </div>
+      <div class="row" style="align-items:center;margin-top:10px">
+        <input id="rtc_year" type="number" placeholder="YYYY" style="width:90px"/>
+        <input id="rtc_month" type="number" placeholder="MM" style="width:70px"/>
+        <input id="rtc_day" type="number" placeholder="DD" style="width:70px"/>
+        <input id="rtc_hour" type="number" placeholder="HH" style="width:70px"/>
+        <input id="rtc_minute" type="number" placeholder="MIN" style="width:70px"/>
+        <input id="rtc_second" type="number" placeholder="SS" style="width:70px"/>
+      </div>
+      <div class="row" style="align-items:center;margin-top:10px">
+        <button class="btn good" onclick="applyRtc()">Set RTC</button>
+        <button class="btn" onclick="fillRtcFromBrowser()">From Browser</button>
+      </div>
+      <div class="note" id="rtcStatus">-</div>
+    </div>
+
+    <div class="card" id="sdSection">
+      <div style="font-weight:800;margin-bottom:10px">SD Card</div>
+      <div class="row">
+        <button class="btn" onclick="refreshSd()">Refresh</button>
+      </div>
+      <div class="kv">
+        <div class="k">Mounted</div><div class="v" id="sdMounted">-</div>
+        <div class="k">Type</div><div class="v" id="sdType">-</div>
+        <div class="k">Total</div><div class="v" id="sdTotal">-</div>
+        <div class="k">Used</div><div class="v" id="sdUsed">-</div>
+        <div class="k">Free</div><div class="v" id="sdFree">-</div>
+      </div>
+      <div class="note" id="sdError">-</div>
+    </div>
+  </div>
+
     <div class="card">
       <div style="font-weight:800;margin-bottom:10px">نمایش</div>
       <div class="big" id="bbChartPanel">
@@ -936,6 +1396,145 @@ let bbLastFrame = -1;
 let rfLastFrame = -1;
 let bbTimer = null;
 let plotMode = 0; // 0=idle, 1=BB, 2=RF
+
+const recordSection = document.getElementById("recordSection");
+const recordBtn = document.getElementById("recordBtn");
+const stopRecordBtn = document.getElementById("stopRecordBtn");
+const recordStateEl = document.getElementById("recordState");
+const recordFileEl = document.getElementById("recordFile");
+const recordLinesEl = document.getElementById("recordLines");
+const recordBytesEl = document.getElementById("recordBytes");
+const recordNoteEl = document.getElementById("recordNote");
+
+const rtcNowEl = document.getElementById("rtcNow");
+const rtcStatusEl = document.getElementById("rtcStatus");
+const rtcYearEl = document.getElementById("rtc_year");
+const rtcMonthEl = document.getElementById("rtc_month");
+const rtcDayEl = document.getElementById("rtc_day");
+const rtcHourEl = document.getElementById("rtc_hour");
+const rtcMinuteEl = document.getElementById("rtc_minute");
+const rtcSecondEl = document.getElementById("rtc_second");
+
+const sdMountedEl = document.getElementById("sdMounted");
+const sdTypeEl = document.getElementById("sdType");
+const sdTotalEl = document.getElementById("sdTotal");
+const sdUsedEl = document.getElementById("sdUsed");
+const sdFreeEl = document.getElementById("sdFree");
+const sdErrorEl = document.getElementById("sdError");
+
+function fmtBytes(n){
+  if (n === undefined || n === null) return "-";
+  const v = Number(n);
+  if (!isFinite(v)) return "-";
+  if (v < 1024) return `${v} B`;
+  const units = ["KB","MB","GB","TB"];
+  let val = v / 1024;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx++;
+  }
+  return `${val.toFixed(2)} ${units[idx]}`;
+}
+
+function updateRecordUI(j){
+  if (!recordSection) return;
+  const run = Number(j.run_status);
+  const running = (run === 1 || run === 2);
+  recordSection.style.display = "block";
+  if (recordBtn) recordBtn.style.display = running ? "inline-flex" : "none";
+  if (stopRecordBtn) stopRecordBtn.style.display = running ? "inline-flex" : "none";
+
+  const canRecord = running && j.sd_mounted && j.rtc_ok;
+  const isRecording = !!j.recording;
+
+  if (recordBtn) recordBtn.disabled = !canRecord || isRecording;
+  if (stopRecordBtn) stopRecordBtn.disabled = !isRecording;
+  if (recordStateEl) {
+    recordStateEl.textContent = isRecording ? "Recording" : "Idle";
+    recordStateEl.classList.toggle("recording", isRecording);
+  }
+  if (recordFileEl) recordFileEl.textContent = j.recording_file || "-";
+  if (recordLinesEl) recordLinesEl.textContent = j.record_lines ?? "-";
+  if (recordBytesEl) recordBytesEl.textContent = fmtBytes(j.record_bytes);
+
+  if (recordNoteEl) {
+    if (j.record_error) recordNoteEl.textContent = j.record_error;
+    else if (j.record_info) recordNoteEl.textContent = j.record_info;
+    else if (!canRecord) recordNoteEl.textContent = "Recording disabled (check SD/RTC/mode)";
+    else recordNoteEl.textContent = "Ready";
+  }
+}
+
+async function startRecord(){
+  await cmd("Record");
+}
+
+async function stopRecord(){
+  await cmd("StopRecord");
+}
+
+async function refreshTime(){
+  const t = getToken();
+  const r = await fetch("/api/time", {headers:{"Authorization": t}});
+  if(!r.ok) return;
+  const j = await r.json();
+  if (rtcNowEl) rtcNowEl.textContent = j.timestamp_iso || "-";
+  if (rtcStatusEl) {
+    if (!j.rtc_ok) rtcStatusEl.textContent = j.error || "RTC not ready";
+    else rtcStatusEl.textContent = "OK";
+  }
+}
+
+function fillRtcFromBrowser(){
+  const d = new Date();
+  if (rtcYearEl) rtcYearEl.value = d.getFullYear();
+  if (rtcMonthEl) rtcMonthEl.value = String(d.getMonth() + 1).padStart(2, "0");
+  if (rtcDayEl) rtcDayEl.value = String(d.getDate()).padStart(2, "0");
+  if (rtcHourEl) rtcHourEl.value = String(d.getHours()).padStart(2, "0");
+  if (rtcMinuteEl) rtcMinuteEl.value = String(d.getMinutes()).padStart(2, "0");
+  if (rtcSecondEl) rtcSecondEl.value = String(d.getSeconds()).padStart(2, "0");
+}
+
+async function applyRtc(){
+  const t = getToken();
+  const payload = {
+    year: parseInt(rtcYearEl?.value || "0"),
+    month: parseInt(rtcMonthEl?.value || "0"),
+    day: parseInt(rtcDayEl?.value || "0"),
+    hour: parseInt(rtcHourEl?.value || "0"),
+    minute: parseInt(rtcMinuteEl?.value || "0"),
+    second: parseInt(rtcSecondEl?.value || "0")
+  };
+
+  const r = await fetch("/api/time",{
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "Authorization": t
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if(!r.ok){
+    alert("Set time failed: HTTP " + r.status);
+    return;
+  }
+  await refreshTime();
+}
+
+async function refreshSd(){
+  const t = getToken();
+  const r = await fetch("/api/sd", {headers:{"Authorization": t}});
+  if(!r.ok) return;
+  const j = await r.json();
+  if (sdMountedEl) sdMountedEl.textContent = j.mounted ? "Yes" : "No";
+  if (sdTypeEl) sdTypeEl.textContent = j.type || "-";
+  if (sdTotalEl) sdTotalEl.textContent = fmtBytes(j.card_size);
+  if (sdUsedEl) sdUsedEl.textContent = fmtBytes(j.used_bytes);
+  if (sdFreeEl) sdFreeEl.textContent = fmtBytes(j.free_bytes);
+  if (sdErrorEl) sdErrorEl.textContent = j.error || (j.mounted ? "OK" : "SD not mounted");
+}
 
 function updateBbMetaFromStatus(j){
   if (bbBytesEl) bbBytesEl.textContent = j.bytes_in_buf ?? "-";
@@ -1051,7 +1650,9 @@ async function cmd(c){
     body: JSON.stringify({Command:c})
   });
   if(!r.ok){
-    alert("HTTP "+r.status);
+    let msg = "";
+    try { msg = await r.text(); } catch(e) { msg = ""; }
+    alert("HTTP " + r.status + (msg ? (": " + msg) : ""));
     return;
   }
   await refresh();
@@ -1085,6 +1686,7 @@ async function refresh(){
     else bbTitleEl.textContent = "Radar Plot";
   }
   updateBbMetaFromStatus(j);
+  updateRecordUI(j);
 }
 
 async function loadSettings(){
@@ -1137,6 +1739,9 @@ async function applySettings(){
 
 setInterval(refresh, 600);
 refresh();
+setInterval(refreshTime, 1000);
+refreshTime();
+refreshSd();
 loadSettings();
 </script>
 </body>
@@ -1158,6 +1763,11 @@ void handleStatus() {
   uint32_t uptime = millis() - bootMs;
   uint32_t bytesInBuf = RadarConnected ? RadarSerial.available() : 0;
 
+  if (gSdReady && SD.cardType() == CARD_NONE) {
+    gSdReady = false;
+    setSdError("No SD card");
+  }
+
   String json = "{";
   json += "\"ip\":\"" + ip + "\",";
   json += "\"connected\":" + String(RadarConnected ? "true" : "false") + ",";
@@ -1168,6 +1778,16 @@ void handleStatus() {
   json += "\"last_pkt_len\":" + String((uint32_t)LastPktLen) + ",";
   json += "\"last_n_floats\":" + String((uint32_t)LastNFloats) + ",";
   json += "\"last_apply_ok\":" + String(LastApplyOk ? "true" : "false") + ",";
+  json += "\"rtc_ok\":" + String(gRtcReady ? "true" : "false") + ",";
+  json += "\"sd_mounted\":" + String(gSdReady ? "true" : "false") + ",";
+  json += "\"sd_error\":\"" + String(gSdError) + "\",";
+  json += "\"recording\":" + String(gRecording ? "true" : "false") + ",";
+  json += "\"recording_file\":\"" + String(gRecordPath) + "\",";
+  json += "\"record_lines\":" + String((unsigned long long)gRecordLines) + ",";
+  json += "\"record_bytes\":" + String((unsigned long long)gRecordBytes) + ",";
+  json += "\"record_error\":\"" + String(gRecordError) + "\",";
+  json += "\"record_info\":\"" + String(gRecordInfo) + "\",";
+  json += "\"record_mode\":\"" + String(gRecordMode == 1 ? "BB" : (gRecordMode == 2 ? "RF" : "")) + "\",";
   json += "\"uptime_ms\":" + String(uptime);
   json += "}";
   server.send(200, "application/json", json);
@@ -1333,6 +1953,108 @@ void handlePostSettings() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+void handleGetTime() {
+  if (!isAuthorized()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!gRtcReady) initRtc();
+
+  String json = "{";
+  json += "\"rtc_ok\":" + String(gRtcReady ? "true" : "false") + ",";
+  if (gRtcReady) {
+    uint64_t epoch_ms = rtcEpochMs();
+    char iso[32];
+    formatIsoTimestamp(epoch_ms, iso, sizeof(iso));
+    json += "\"timestamp_iso\":\"" + String(iso) + "\",";
+    json += "\"epoch_ms\":" + String((unsigned long long)epoch_ms) + ",";
+  } else {
+    json += "\"timestamp_iso\":\"\",";
+    json += "\"epoch_ms\":0,";
+  }
+  json += "\"error\":\"" + String(gRtcError) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handlePostTime() {
+  if (!isAuthorized()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Bad Request");
+    return;
+  }
+
+  String body = server.arg("plain");
+  double v;
+  bool ok = true;
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+
+  if (jsonGetNumber(body, "year", v)) year = (int)v; else ok = false;
+  if (jsonGetNumber(body, "month", v)) month = (int)v; else ok = false;
+  if (jsonGetNumber(body, "day", v)) day = (int)v; else ok = false;
+  if (jsonGetNumber(body, "hour", v)) hour = (int)v; else ok = false;
+  if (jsonGetNumber(body, "minute", v)) minute = (int)v; else ok = false;
+  if (jsonGetNumber(body, "second", v)) second = (int)v; else ok = false;
+
+  if (!ok) {
+    server.send(400, "text/plain", "Missing time fields");
+    return;
+  }
+
+  if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    server.send(400, "text/plain", "Invalid time");
+    return;
+  }
+
+  if (!gRtcReady) initRtc();
+  if (!gRtcReady) {
+    server.send(500, "text/plain", "RTC not ready");
+    return;
+  }
+
+  rtc.adjust(DateTime(year, month, day, hour, minute, second));
+  rtcSyncAligned(1200);
+  setRtcError("");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSdStatus() {
+  if (!isAuthorized()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!gSdReady) initSd();
+  if (gSdReady && SD.cardType() == CARD_NONE) {
+    gSdReady = false;
+    setSdError("No SD card");
+  }
+
+  uint64_t cardSize = gSdReady ? SD.cardSize() : 0;
+  uint64_t usedSize = gSdReady ? sdUsedBytes(SD, "/", 0) : 0;
+  uint64_t freeSize = (cardSize > usedSize) ? (cardSize - usedSize) : 0;
+
+  String json = "{";
+  json += "\"mounted\":" + String(gSdReady ? "true" : "false") + ",";
+  json += "\"type\":\"" + String(sdCardTypeName(SD.cardType())) + "\",";
+  json += "\"card_size\":" + String((unsigned long long)cardSize) + ",";
+  json += "\"used_bytes\":" + String((unsigned long long)usedSize) + ",";
+  json += "\"free_bytes\":" + String((unsigned long long)freeSize) + ",";
+  json += "\"error\":\"" + String(gSdError) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void handleCmd() {
   if (!isAuthorized()) {
     server.send(401, "text/plain", "Unauthorized");
@@ -1361,7 +2083,15 @@ void handleCmd() {
   else if (cmd == "RunBB") radarRunBB();
   else if (cmd == "Stop") radarStopAndReboot();  // ✅ Stop + Auto Reboot (Disconnect+Connect)
   else if (cmd == "Reboot") radarReboot();
-  else if (cmd == "Record") { /* placeholder */ } else {
+  else if (cmd == "Record") {
+    if (!recordStart()) {
+      String msg = gRecordError[0] ? gRecordError : "Record failed";
+      server.send(409, "text/plain", msg);
+      return;
+    }
+  } else if (cmd == "StopRecord") {
+    recordStop(false, "Stopped");
+  } else {
     server.send(400, "text/plain", "Unknown Command");
     return;
   }
@@ -1378,6 +2108,12 @@ void setup() {
   led_init();
   led_set(5, 5);
 
+  gRecordMutex = xSemaphoreCreateMutex();
+  if (!gRecordMutex) setRecordError("Record mutex failed");
+
+  initRtc();
+  initSd();
+
 #if USE_SOFTAP
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -1393,6 +2129,10 @@ void setup() {
   server.on("/api/rf_raw", HTTP_GET, handleRfRawData);
   server.on("/api/bb", HTTP_GET, handleBbData);
   server.on("/api/cmd", HTTP_POST, handleCmd);
+
+  server.on("/api/time", HTTP_GET, handleGetTime);
+  server.on("/api/time", HTTP_POST, handlePostTime);
+  server.on("/api/sd", HTTP_GET, handleSdStatus);
 
   server.on("/api/settings", HTTP_GET, handleGetSettings);
   server.on("/api/settings", HTTP_POST, handlePostSettings);
